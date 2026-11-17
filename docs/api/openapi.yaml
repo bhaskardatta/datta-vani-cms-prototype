@@ -1,0 +1,1149 @@
+openapi: 3.1.0
+info:
+  title: cms-service (DRAFT)
+  version: 0.1.0-draft
+  summary: Proposed contract for the Datta Vani CMS backend, for the contract-first discussion.
+  description: |
+    **Status: proposal, not agreed.** Derived from what the prototype's store actions do
+    (`src/lib/store.ts`) and the rules in `src/lib/domain/`. Open questions are listed in
+    `docs/api/README.md`. Nothing here is implemented.
+
+    Conventions:
+    - The environment (`staging` or `production`) is an explicit path parameter. Content writes are
+      accepted on `staging` only; on `production` they return 403 with the reason. Switches are
+      accepted on both, subject to role.
+    - Every write is checked on the server with the same guards the prototype uses (`block…`
+      functions). A refused request changes nothing and writes no audit entry.
+    - Every accepted write appends an audit entry in the same transaction.
+    - Errors use `application/problem+json` (RFC 9457). `reason` carries the guard's
+      human-readable message, which the CMS website shows on the disabled control.
+    - Writes to an item take `If-Match` with the item's `version`; a stale version returns 412.
+    - Roles per operation are given in `x-roles` (`content_manager`, `super_admin`, `support_lead`).
+servers:
+  - url: /api/v1
+    description: Relative to wherever cms-service is deployed (not decided).
+security:
+  - bearerAuth: []
+tags:
+  - name: Library
+    description: 'What exists in an environment.'
+  - name: Editing
+    description: 'Text, images, structure and stories. Staging only.'
+  - name: Audio
+    description: 'Per chunk, language and voice: regenerate, upload, approve, reject.'
+  - name: Quizzes
+    description: 'Questions per chapter; words per language, answer and order shared.'
+  - name: Review
+    description: 'Validation and the draft → in review → approved workflow.'
+  - name: Switches
+    description: 'Item and language on/off, per environment.'
+  - name: Promote
+    description: 'Staging → production: plan, dry run, promote, revert. Super Admin only.'
+  - name: Activity
+    description: 'The append-only audit log.'
+
+paths:
+  /envs/{env}/items:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+    get:
+      tags: [Library]
+      operationId: listItems
+      summary: Library rows (FR-LIB-01..05)
+      description: Every epic and bedtime story with status, switches, coverage and error counts per language.
+      x-roles: [content_manager, super_admin, support_lead]
+      parameters:
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/ItemKind' }
+      responses:
+        '200':
+          description: Library rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/ItemSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Editing]
+      operationId: createStory
+      summary: Create a bedtime story (FR-STORY-01, FR-STORY-06)
+      description: Creates a switched-off draft with one scene and one empty chunk. Staging only.
+      x-roles: [content_manager, super_admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string, minLength: 1, description: English title; trimmed. }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Item' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /envs/{env}/items/{itemId}:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+    get:
+      tags: [Library]
+      operationId: getItem
+      summary: The whole content tree of one item (FR-EDIT-04)
+      x-roles: [content_manager, super_admin, support_lead]
+      responses:
+        '200':
+          description: The item. The `ETag` header carries `version`.
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Item' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Editing]
+      operationId: deleteDraft
+      summary: Delete a story draft that never reached production (FR-STORY-07, FR-STORY-08; Proposed, ADR 0011)
+      description: Staging only. Refused for anything in review, approved, or present in production.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204': { description: Deleted. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/nodes/{nodeId}/text:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/NodeId'
+    patch:
+      tags: [Editing]
+      operationId: editText
+      summary: Edit one localized text field of a node (FR-EDIT-01..06, FR-AUD-01..03)
+      description: |
+        Staging only. Saving the same text is not a change (200 with `changed: false`, nothing logged).
+        Changing a chunk's `text` marks that language's current and draft audio stale; missing audio stays
+        missing. Editing an approved item sends it back to draft. The CMS never fills in a translation.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [field, lang, value]
+              properties:
+                field:
+                  type: string
+                  enum: [name, description, title, content, takeaway, ask, text]
+                lang: { $ref: '#/components/schemas/Lang' }
+                value: { type: string, description: Stored as UTF-8; trailing spaces trimmed (NFR-07). }
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/nodes/{nodeId}/images/{slot}:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/NodeId'
+      - name: slot
+        in: path
+        required: true
+        schema: { type: string, enum: [cover, portrait, landscape] }
+    put:
+      tags: [Editing]
+      operationId: uploadImage
+      summary: Upload or replace an image (story cover, scene portrait or landscape)
+      description: Staging only. Images are shared by every language. The server writes the original plus WebP 1x and 2x at the fixed path.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, contentMediaType: image/* }
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+        '415': { $ref: '#/components/responses/UnsupportedMedia' }
+
+  /envs/{env}/items/{itemId}/tags:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+    put:
+      tags: [Editing]
+      operationId: setStoryTags
+      summary: Set a story's themes and characters (FR-STORY-02)
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [themes, characters]
+              properties:
+                themes: { type: array, items: { type: string } }
+                characters: { type: array, items: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/nodes/{nodeId}/children:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [Editing]
+      operationId: addChild
+      summary: Add a scene (to a chapter or story) or a chunk (to a scene)
+      description: A new scene comes with one empty chunk. Staging only.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type: { type: string, enum: [scene, chunk] }
+      responses:
+        '201': { $ref: '#/components/responses/Applied' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/chunks/{chunkId}/audio/{lang}/{voice}:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/ChunkId'
+      - $ref: '#/components/parameters/LangPath'
+      - $ref: '#/components/parameters/VoicePath'
+    put:
+      tags: [Audio]
+      operationId: uploadAudio
+      summary: Upload a recorded file; the transcript is made from it (FR-AUD-05)
+      description: Creates a draft that keeps the file name. Staging only. The file lands at `<chunk folder>/[<lang>/]body/<voice>/audio.mp3`.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, contentMediaType: audio/* }
+      responses:
+        '202': { $ref: '#/components/responses/AudioDraft' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+        '415': { $ref: '#/components/responses/UnsupportedMedia' }
+
+  /envs/{env}/items/{itemId}/chunks/{chunkId}/audio/{lang}/{voice}/regenerate:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/ChunkId'
+      - $ref: '#/components/parameters/LangPath'
+      - $ref: '#/components/parameters/VoicePath'
+    post:
+      tags: [Audio]
+      operationId: regenerateAudio
+      summary: Generate audio and transcript from the text, as a draft (FR-AUD-04)
+      description: Refused when the chunk has no text in this language. Generation is asynchronous; poll the item or the audio state.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '202': { $ref: '#/components/responses/AudioDraft' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/chunks/{chunkId}/audio/{lang}/{voice}/approve:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/ChunkId'
+      - $ref: '#/components/parameters/LangPath'
+      - $ref: '#/components/parameters/VoicePath'
+    post:
+      tags: [Audio]
+      operationId: approveAudio
+      summary: Approve a draft; it becomes current (FR-AUD-04, FR-AUD-08)
+      description: Only a draft can be approved; anything else returns 409.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/chunks/{chunkId}/audio/{lang}/{voice}/reject:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/ChunkId'
+      - $ref: '#/components/parameters/LangPath'
+      - $ref: '#/components/parameters/VoicePath'
+    post:
+      tags: [Audio]
+      operationId: rejectAudio
+      summary: Reject a draft; restores exactly what was there before the first draft (FR-AUD-06..08)
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/chunks/{chunkId}/audio/{lang}/{voice}/transcript:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/ChunkId'
+      - $ref: '#/components/parameters/LangPath'
+      - $ref: '#/components/parameters/VoicePath'
+    get:
+      tags: [Audio]
+      operationId: getTranscript
+      summary: Word timings for one voice (FR-AUD-10)
+      x-roles: [content_manager, super_admin, support_lead]
+      responses:
+        '200':
+          description: One entry per word, in order, without overlaps.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/WordTiming' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /envs/{env}/items/{itemId}/quizzes/{quizId}/questions:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/QuizId'
+    post:
+      tags: [Quizzes]
+      operationId: addQuestion
+      summary: Add a question (English first)
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type]
+              properties:
+                type: { $ref: '#/components/schemas/QuestionType' }
+      responses:
+        '201': { $ref: '#/components/responses/Applied' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/quizzes/{quizId}/questions/{questionId}:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+      - $ref: '#/components/parameters/QuizId'
+      - name: questionId
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [Quizzes]
+      operationId: editQuestion
+      summary: Edit a question (FR-QUIZ-01, FR-QUIZ-02, FR-QUIZ-05)
+      description: |
+        `type`, `answer` and adding options are English-only and apply to every language (one shared option list).
+        `prompt`, `hint` and option text are per language. Changing the type to true-or-false replaces the options.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                type: { $ref: '#/components/schemas/QuestionType' }
+                answer: { type: integer, minimum: 0, description: Index into options. }
+                addOption: { type: boolean, const: true }
+                lang: { $ref: '#/components/schemas/Lang' }
+                prompt: { type: string, description: Requires `lang`. }
+                hint: { type: string, description: Requires `lang`. }
+                option:
+                  type: object
+                  description: One option's text in `lang`.
+                  required: [index, value]
+                  properties:
+                    index: { type: integer, minimum: 0 }
+                    value: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+
+  /envs/{env}/items/{itemId}/validation:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+    get:
+      tags: [Review]
+      operationId: validateItem
+      summary: Validation report (FR-VAL-01..07)
+      description: Errors block send for review, approve, promote and switching on. Warnings do not.
+      x-roles: [content_manager, super_admin, support_lead]
+      responses:
+        '200':
+          description: Issues per language.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationReport' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /envs/{env}/items/{itemId}/status:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+    post:
+      tags: [Review]
+      operationId: changeStatus
+      summary: Send for review, approve, or send back to draft (FR-REV-01..06)
+      description: |
+        `in_review`: an editor on staging, no validation errors in any started language (422 lists them).
+        `ready` (approve): Super Admin, no English errors. `draft`: an editor on staging.
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to: { $ref: '#/components/schemas/Status' }
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /envs/{env}/items/{itemId}/switches:
+    parameters:
+      - $ref: '#/components/parameters/Env'
+      - $ref: '#/components/parameters/ItemId'
+    patch:
+      tags: [Switches]
+      operationId: setSwitches
+      summary: Switch an item or a language on or off (FR-SW-01..06)
+      description: |
+        Staging: Content Manager or Super Admin. Production: Super Admin only.
+        Production switch-on is refused while English has errors (item) or the language is not complete (language).
+        Switching off is always allowed. Families see a production change after the app's cache refresh (about 10 minutes).
+      x-roles: [content_manager, super_admin]
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                active: { type: boolean }
+                languages:
+                  type: object
+                  description: English is always on and cannot be switched.
+                  additionalProperties: false
+                  properties:
+                    te: { type: boolean }
+                    kn: { type: boolean }
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '412': { $ref: '#/components/responses/StaleVersion' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /promotions/plans:
+    post:
+      tags: [Promote]
+      operationId: planPromotion
+      summary: Build the promote plan for one staging item (FR-PRO-01..03, FR-PRO-10)
+      description: |
+        Matches the staging item to production by its saved match, lists new, changed and unchanged chunks per
+        chosen language with before and after text, counts files, and evaluates the 17 pre-promote checks.
+        Writes nothing. `planHash` identifies this exact plan for the dry run and the promote.
+      x-roles: [super_admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromoteRequest' }
+      responses:
+        '200':
+          description: The plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromotePlan' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /promotions/dry-runs:
+    post:
+      tags: [Promote]
+      operationId: dryRunPromotion
+      summary: Run the exact plan without writing anything
+      x-roles: [super_admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planHash]
+              properties:
+                planHash: { type: string }
+      responses:
+        '200':
+          description: Dry-run result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DryRun' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /promotions:
+    post:
+      tags: [Promote]
+      operationId: promote
+      summary: Promote one item to production (FR-PRO-04..09, FR-PRO-11, FR-PRO-14)
+      description: |
+        One item per call, one transaction. A snapshot of the production rows is written first. Production IDs are
+        kept and rows updated in place; nothing in production is deleted; languages not chosen keep their production
+        values. A new item lands switched off with only English on; an existing item keeps its switches.
+        Refused (409) if staging changed since the plan, the dry run did not pass for this `planHash`, or another
+        promote of the item is running. `confirm` must repeat the item's English name and the word `production`.
+      x-roles: [super_admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [planHash, confirm]
+              properties:
+                planHash: { type: string }
+                confirm:
+                  type: object
+                  required: [itemName, environment]
+                  properties:
+                    itemName: { type: string }
+                    environment: { type: string, const: production }
+      responses:
+        '201':
+          description: Promoted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Promotion' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /promotions/{promotionId}/revert:
+    parameters:
+      - name: promotionId
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [Promote]
+      operationId: revertPromotion
+      summary: Undo a promote from its snapshot (FR-PRO-11..14)
+      description: |
+        Restores the snapshot, or switches a new item off (nothing is deleted). Only the item's latest promote can
+        be reverted (one level of undo, open question). With nothing to undo it changes nothing (409).
+      x-roles: [super_admin]
+      responses:
+        '200': { $ref: '#/components/responses/Applied' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /audit:
+    get:
+      tags: [Activity]
+      operationId: listAudit
+      summary: The activity log, newest first (FR-AUDIT-01, FR-AUDIT-02)
+      description: Append-only. There is no endpoint to change or remove an entry.
+      x-roles: [content_manager, super_admin, support_lead]
+      parameters:
+        - name: env
+          in: query
+          schema: { $ref: '#/components/schemas/Env' }
+        - name: q
+          in: query
+          description: Matches action, target and who.
+          schema: { type: string }
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: One page of entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEntry' }
+                  nextCursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /catalog:
+    get:
+      tags: [Editing]
+      operationId: getCatalog
+      summary: Theme and character names a story can be tagged with
+      x-roles: [content_manager, super_admin, support_lead]
+      responses:
+        '200':
+          description: The catalog.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [themes, characters]
+                properties:
+                  themes: { type: array, items: { type: string } }
+                  characters: { type: array, items: { type: string } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The user's Datta Vani login. cms-service reads the role from it and checks it on every request.
+
+  parameters:
+    Env:
+      name: env
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Env' }
+    ItemId:
+      name: itemId
+      in: path
+      required: true
+      schema: { type: string }
+    NodeId:
+      name: nodeId
+      in: path
+      required: true
+      schema: { type: string }
+    ChunkId:
+      name: chunkId
+      in: path
+      required: true
+      schema: { type: string }
+    QuizId:
+      name: quizId
+      in: path
+      required: true
+      schema: { type: string }
+    LangPath:
+      name: lang
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Lang' }
+    VoicePath:
+      name: voice
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Voice' }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: The item `version` the change was made against.
+      schema: { type: string }
+
+  responses:
+    Applied:
+      description: The change was applied (or, for an unchanged text, `changed` is false). Returns the updated item.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [changed, item]
+            properties:
+              changed: { type: boolean }
+              item: { $ref: '#/components/schemas/Item' }
+    AudioDraft:
+      description: A draft is being made; the asset is in state `draft` once ready.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Audio' }
+    BadRequest:
+      description: The request is malformed.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Not signed in.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Forbidden:
+      description: The role or environment does not allow this. `reason` says why. Nothing changed, nothing logged.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: No such item or node in this environment.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Conflict:
+      description: The action does not apply in the current state (for example approve on a non-draft, or a stale plan).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    StaleVersion:
+      description: Someone else changed the item since `If-Match`. Reload and retry.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    UnsupportedMedia:
+      description: The file is not of the expected type (for example a text file uploaded as audio).
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationFailed:
+      description: Blocked by validation errors; `issues` lists them.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Env: { type: string, enum: [staging, production] }
+    Lang: { type: string, enum: [en, te, kn] }
+    Voice: { type: string, enum: [female, male, child] }
+    Status:
+      type: string
+      enum: [draft, in_review, ready]
+      description: '`ready` is shown as "Approved".'
+    ItemKind: { type: string, enum: [book, story] }
+    QuestionType: { type: string, enum: [mcq, tf, fill, match, anagram] }
+
+    LocalizedText:
+      type: object
+      description: One string per language. English is the source and the fallback.
+      additionalProperties: false
+      properties:
+        en: { type: string }
+        te: { type: string }
+        kn: { type: string }
+
+    Audio:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [current, draft, stale, missing]
+          description: current = approved; draft = waiting for approval; stale = the text changed after it was made.
+        source: { type: string, enum: [generated, uploaded] }
+        file: { type: string, description: Original file name of an upload. }
+        audioPath:
+          type: string
+          readOnly: true
+          description: 'Fixed path, e.g. `…/chunks/2/te/body/female/audio.mp3`.'
+        transcriptPath: { type: string, readOnly: true }
+
+    VoiceAudio:
+      type: object
+      additionalProperties: false
+      properties:
+        female: { $ref: '#/components/schemas/Audio' }
+        male: { $ref: '#/components/schemas/Audio' }
+        child: { $ref: '#/components/schemas/Audio' }
+
+    WordTiming:
+      type: object
+      required: [word, start, end]
+      properties:
+        word: { type: string }
+        start: { type: number, description: Seconds. }
+        end: { type: number }
+
+    Chunk:
+      type: object
+      required: [id, text, audio]
+      properties:
+        id: { type: string }
+        text: { $ref: '#/components/schemas/LocalizedText' }
+        audio:
+          type: object
+          additionalProperties: false
+          properties:
+            en: { $ref: '#/components/schemas/VoiceAudio' }
+            te: { $ref: '#/components/schemas/VoiceAudio' }
+            kn: { $ref: '#/components/schemas/VoiceAudio' }
+
+    Scene:
+      type: object
+      required: [id, chunks]
+      properties:
+        id: { type: string }
+        portrait: { type: string }
+        landscape: { type: string }
+        chunks: { type: array, items: { $ref: '#/components/schemas/Chunk' } }
+
+    Question:
+      type: object
+      required: [id, type, prompt, options, answer, hint]
+      properties:
+        id: { type: string }
+        type: { $ref: '#/components/schemas/QuestionType' }
+        prompt: { $ref: '#/components/schemas/LocalizedText' }
+        options:
+          type: array
+          description: One list shared by every language, so the correct answer and order are the same in all of them.
+          items: { $ref: '#/components/schemas/LocalizedText' }
+        answer: { type: integer, minimum: 0 }
+        hint: { $ref: '#/components/schemas/LocalizedText' }
+
+    Quiz:
+      type: object
+      required: [id, questions]
+      properties:
+        id: { type: string }
+        questions: { type: array, items: { $ref: '#/components/schemas/Question' } }
+
+    Chapter:
+      type: object
+      required: [id, title, content, takeaway, ask, scenes]
+      properties:
+        id: { type: string }
+        title: { $ref: '#/components/schemas/LocalizedText' }
+        content: { $ref: '#/components/schemas/LocalizedText' }
+        takeaway: { $ref: '#/components/schemas/LocalizedText' }
+        ask: { $ref: '#/components/schemas/LocalizedText' }
+        scenes: { type: array, items: { $ref: '#/components/schemas/Scene' } }
+        quiz: { $ref: '#/components/schemas/Quiz' }
+
+    Section:
+      type: object
+      required: [id, title, chapters]
+      properties:
+        id: { type: string }
+        title: { $ref: '#/components/schemas/LocalizedText' }
+        chapters: { type: array, items: { $ref: '#/components/schemas/Chapter' } }
+
+    ItemBase:
+      type: object
+      required: [id, kind, num, name, description, status, active, languagesOn, updatedAt, version]
+      properties:
+        id: { type: string }
+        kind: { $ref: '#/components/schemas/ItemKind' }
+        num: { type: integer, description: Used in media paths. }
+        name: { $ref: '#/components/schemas/LocalizedText' }
+        description: { $ref: '#/components/schemas/LocalizedText' }
+        status: { $ref: '#/components/schemas/Status' }
+        active: { type: boolean, description: Root switch. }
+        languagesOn:
+          type: object
+          required: [en, te, kn]
+          properties:
+            en: { type: boolean, const: true }
+            te: { type: boolean }
+            kn: { type: boolean }
+        updatedAt: { type: string, format: date-time }
+        version: { type: string, description: Changes on every write; send it back in If-Match. }
+
+    Book:
+      allOf:
+        - $ref: '#/components/schemas/ItemBase'
+        - type: object
+          required: [sections]
+          properties:
+            kind: { const: book }
+            sections: { type: array, items: { $ref: '#/components/schemas/Section' } }
+
+    Story:
+      allOf:
+        - $ref: '#/components/schemas/ItemBase'
+        - type: object
+          required: [themes, characters, scenes]
+          properties:
+            kind: { const: story }
+            cover: { type: string }
+            themes: { type: array, items: { type: string } }
+            characters: { type: array, items: { type: string } }
+            scenes: { type: array, items: { $ref: '#/components/schemas/Scene' } }
+
+    Item:
+      oneOf:
+        - $ref: '#/components/schemas/Book'
+        - $ref: '#/components/schemas/Story'
+      discriminator:
+        propertyName: kind
+        mapping:
+          book: '#/components/schemas/Book'
+          story: '#/components/schemas/Story'
+
+    LanguageSummary:
+      type: object
+      required: [on, coverage, errors]
+      properties:
+        on: { type: boolean }
+        coverage:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Chunks with text and current audio in every required voice, divided by all chunks.
+        errors: { type: integer, minimum: 0 }
+
+    ItemSummary:
+      type: object
+      required: [id, kind, name, status, active, inProduction, languages, updatedAt]
+      properties:
+        id: { type: string }
+        kind: { $ref: '#/components/schemas/ItemKind' }
+        name: { type: string, description: English name. }
+        status: { $ref: '#/components/schemas/Status' }
+        active: { type: boolean }
+        inProduction:
+          type: [object, 'null']
+          description: The matched production item's switch, or null when it is not in production yet.
+          properties:
+            active: { type: boolean }
+        languages:
+          type: object
+          required: [en, te, kn]
+          properties:
+            en: { $ref: '#/components/schemas/LanguageSummary' }
+            te: { $ref: '#/components/schemas/LanguageSummary' }
+            kn: { $ref: '#/components/schemas/LanguageSummary' }
+        updatedAt: { type: string, format: date-time }
+
+    Issue:
+      type: object
+      required: [level, lang, nodeId, where, message]
+      properties:
+        level: { type: string, enum: [error, warning] }
+        lang:
+          allOf: [{ $ref: '#/components/schemas/Lang' }]
+          description: Language-independent problems are reported once, under `en`.
+        nodeId: { type: string }
+        where: { type: string, description: 'Breadcrumb, e.g. "The King of Ayodhya › Scene 1 › Chunk 1".' }
+        message: { type: string }
+
+    ValidationReport:
+      type: object
+      required: [issues]
+      properties:
+        issues: { type: array, items: { $ref: '#/components/schemas/Issue' } }
+
+    PromoteRequest:
+      type: object
+      required: [itemId, langs]
+      properties:
+        itemId: { type: string, description: The staging item. }
+        langs:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          description: Must include `en`.
+          items: { $ref: '#/components/schemas/Lang' }
+
+    Change:
+      type: object
+      required: [where, lang, kind, after]
+      properties:
+        where: { type: string }
+        lang: { $ref: '#/components/schemas/Lang' }
+        kind: { type: string, enum: [new, changed], description: 'Promote never deletes, so there is no "deleted".' }
+        before: { type: string }
+        after: { type: string }
+
+    Check:
+      type: object
+      required: [number, name, state, blocking]
+      properties:
+        number: { type: integer, minimum: 1, maximum: 17 }
+        name: { type: string }
+        state: { type: string, enum: [pass, fail, warn, pending] }
+        blocking: { type: boolean, description: A failed blocking check stops the promote. }
+        note: { type: string }
+
+    PromotePlan:
+      type: object
+      required: [planHash, itemId, target, langs, counts, changes, files, checks]
+      properties:
+        planHash: { type: string }
+        itemId: { type: string }
+        target:
+          type: object
+          required: [exists]
+          properties:
+            exists: { type: boolean }
+            productionItemId: { type: string }
+            active: { type: boolean }
+        langs: { type: array, items: { $ref: '#/components/schemas/Lang' } }
+        counts:
+          type: object
+          description: Per language.
+          additionalProperties:
+            type: object
+            required: [new, changed, unchanged]
+            properties:
+              new: { type: integer }
+              changed: { type: integer }
+              unchanged: { type: integer }
+        changes: { type: array, items: { $ref: '#/components/schemas/Change' } }
+        files: { type: integer, description: Audio and transcript files to copy. }
+        checks:
+          type: array
+          minItems: 17
+          maxItems: 17
+          items: { $ref: '#/components/schemas/Check' }
+
+    DryRun:
+      type: object
+      required: [planHash, clean, lines]
+      properties:
+        planHash: { type: string }
+        clean: { type: boolean }
+        lines: { type: array, items: { type: string } }
+
+    Promotion:
+      type: object
+      required: [id, itemId, productionItemId, langs, existed, at, by]
+      properties:
+        id: { type: string }
+        itemId: { type: string }
+        productionItemId: { type: string }
+        langs: { type: array, items: { $ref: '#/components/schemas/Lang' } }
+        existed: { type: boolean, description: False when the item was created in production (it landed switched off). }
+        at: { type: string, format: date-time }
+        by: { type: string }
+
+    AuditEntry:
+      type: object
+      required: [id, at, who, env, action, target]
+      properties:
+        id: { type: string }
+        at: { type: string, format: date-time }
+        who: { type: string }
+        env: { $ref: '#/components/schemas/Env' }
+        action: { type: string }
+        target: { type: string }
+        detail: { type: string }
+        before: { type: string }
+        after: { type: string }
+
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri-reference }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        reason: { type: string, description: 'The guard''s message, e.g. "Only a Super Admin can promote".' }
+        issues:
+          type: array
+          description: Present on 422.
+          items: { $ref: '#/components/schemas/Issue' }

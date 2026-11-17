@@ -1,0 +1,98 @@
+@import "tailwindcss";
+
+/* Tokens lifted from the Datta Vani onboarding site (light theme). */
+@theme {
+  --color-bg: #F4F5F8;
+  --color-surface: #FFFFFF;
+  --color-ink: #1E1A4D;
+  --color-muted: #595E70;
+  --color-faint: #8A8FA3; /* icons and borders only: under 4.5:1 for small text */
+  --color-line: #DFE2EB;
+  --color-line-strong: #C9CDDA;
+  --color-indigo: #4F39F6;
+  --color-indigo-deep: #3B27D1;
+  --color-tint: #EEF2FF;
+  --color-coral: #FC8865;
+  --color-coral-deep: #A6421F;
+  --color-coral-tint: #FFF0EB;
+  --color-sun: #FFFAF1;
+  --color-leaf: #19764F; /* darkened from #1F845A: 4.1:1 on leaf-tint failed WCAG AA for the small pill text */
+  --color-leaf-tint: #E7F5EE;
+  --color-amber: #9A5B00;
+  --color-amber-tint: #FFF4DE;
+  --color-danger: #C42B1C;
+  --color-danger-deep: #A32216;
+  --color-danger-tint: #FDECEA;
+
+  --font-sans: var(--font-inter), system-ui, sans-serif;
+  --font-display: var(--font-dm-sans), var(--font-inter), sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, monospace;
+
+  /* Ink-tinted shadows: softer than neutral black on the cool grey background. */
+  --shadow-xs: 0 1px 2px rgb(30 26 77 / 0.05);
+  --shadow-sm: 0 1px 2px rgb(30 26 77 / 0.05), 0 1px 3px rgb(30 26 77 / 0.07);
+  --shadow-md: 0 4px 12px -2px rgb(30 26 77 / 0.10), 0 2px 4px -2px rgb(30 26 77 / 0.06);
+  --shadow-lg: 0 12px 32px -8px rgb(30 26 77 / 0.20), 0 4px 8px -4px rgb(30 26 77 / 0.08);
+  --shadow-xl: 0 24px 56px -12px rgb(30 26 77 / 0.30);
+
+  --animate-toast-in: toast-in 0.24s ease-out;
+  --animate-pop-in: pop-in 0.2s ease-out;
+  --animate-fade-up: fade-up 0.25s ease-out;
+}
+
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes pop-in { from { opacity: 0; transform: translateY(6px) scale(0.985); } to { opacity: 1; transform: none; } }
+@keyframes fade-up { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+
+html, body { height: 100%; }
+body { background: var(--color-bg); color: var(--color-ink); font-feature-settings: "cv11", "ss01"; }
+p, li { text-wrap: pretty; }
+h1, h2, h3 { text-wrap: balance; }
+
+:focus-visible { outline: 2px solid var(--color-indigo); outline-offset: 2px; border-radius: 6px; }
+
+/* Telugu and Kannada: larger and taller than Latin so the conjuncts and vowel signs breathe.
+   Only set on leaf elements (inputs, paragraphs, spans) so the em size never compounds. */
+[lang="te"], [lang="kn"] {
+  font-family: var(--font-inter), "Noto Sans Telugu", "Kohinoor Telugu", "Telugu Sangam MN",
+    "Noto Sans Kannada", "Kannada Sangam MN", system-ui, sans-serif;
+  font-size: 1.08em;
+  line-height: 1.75;
+}
+
+/* Honest image placeholder */
+.ph {
+  background: repeating-linear-gradient(45deg, #E9EBF2, #E9EBF2 10px, #F4F5F8 10px, #F4F5F8 20px);
+}
+
+dialog::backdrop { background: rgb(30 26 77 / 0.40); backdrop-filter: blur(2px); }
+dialog[open] { animation: var(--animate-pop-in); }
+
+/* Thin scrollbars for the tree and side panels */
+.scroll-thin { scrollbar-width: thin; scrollbar-color: var(--color-line-strong) transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* A box that scrolls sideways (wide table): fading shadows at the edges show there is more to see.
+   Background-attachment trick: the covers scroll with the content, the shadows stay with the box. */
+.scroll-fade {
+  background:
+    linear-gradient(to right, var(--color-surface) 30%, transparent) left / 40px 100% no-repeat local,
+    linear-gradient(to left, var(--color-surface) 30%, transparent) right / 40px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgb(30 26 77 / 0.14), transparent) left / 14px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgb(30 26 77 / 0.14), transparent) right / 14px 100% no-repeat scroll;
+}
+
+/* Touch screens: text at least 16px (iOS also zooms into any field smaller than that), Telugu and Kannada a little larger. */
+@media (pointer: coarse) {
+  body, .text-sm, .text-\[15px\] { font-size: 16px; }
+  input, select, textarea { font-size: max(16px, 1em) !important; }
+  :is(input, textarea):is([lang="te"], [lang="kn"]) { font-size: max(17.5px, 1.08em) !important; }
+}
+
+/* The menu drawer slides in from the left instead of the dialog pop-in. */
+@keyframes drawer-in { from { transform: translateX(-100%); } to { transform: none; } }
+dialog#menu-drawer[open] { animation: drawer-in 0.24s ease-out; }
+dialog#menu-drawer::backdrop { backdrop-filter: none; }
